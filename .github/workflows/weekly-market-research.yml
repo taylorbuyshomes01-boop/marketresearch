@@ -10,7 +10,7 @@ permissions:
 jobs:
   generate-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -42,10 +42,10 @@ jobs:
           cp "$LATEST" docs/index.html
 
       - name: Generate cash sales dashboard
-              run: python scripts/pull_cash_sales.py
-                      env:
-                                ATTOM_API_KEY: ${{ secrets.ATTOM_API_KEY }}
-                                
+        run: python scripts/pull_cash_sales.py
+        env:
+          ATTOM_API_KEY: ${{ secrets.ATTOM_API_KEY }}
+
       - name: Commit report
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -57,4 +57,3 @@ jobs:
             git commit -m "Market report $(date +%Y-%m-%d) - auto-generated"
             git push
           fi
-
