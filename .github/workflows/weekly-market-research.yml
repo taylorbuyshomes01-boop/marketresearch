@@ -1,0 +1,55 @@
+name: Weekly Market Research
+
+on:
+  schedule:
+    - cron: '0 17 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate market report
+        run: |
+          python scripts/pull_and_report.py --output docs/ --no-cache
+          ls -lh docs/
+
+      - name: Set index.html to latest report
+        run: |
+          LATEST=$(ls docs/market_research_*.html | sort | tail -1)
+          cp "$LATEST" docs/index.html
+
+      - name: Commit report
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "Market Research Bot"
+          git add docs/
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Market report $(date +%Y-%m-%d) - auto-generated"
+            git push
+          fi
+
