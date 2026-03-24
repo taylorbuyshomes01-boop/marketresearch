@@ -813,24 +813,58 @@ def main():
                 del zips[zc]
                 print(f'    Removed {zc} ({metro})')
 
-        # 5. Determine what needs ATTOM refresh
+        # 5. Determine what needs ATTOM refresh + register new qualifying zips
+        # KEY DESIGN: We only call ATTOM for zips already in cash_data that are
+        # 60+ days stale. Brand-new qualifying zips are added to the dashboard
+        # with Redfin metadata only — no ATTOM call on first appearance.
+        # This prevents burning quota on the full qualifying list every run.
         today    = datetime.now().date()
         to_pull  = []
+        new_count = 0
         for zc, mkt in qualifying_zips.items():
             existing = zips.get(zc)
             if existing is None:
-                to_pull.append((zc, mkt, 'new'))
+                # Brand-new qualifying zip — register it with Redfin metadata.
+                # Set last_pulled = today so it won't be flagged stale until
+                # REFRESH_DAYS from now, at which point ATTOM will be called.
+                new_count += 1
+                zips[zc] = {
+                    'zip':         zc,
+                    'cash_count':  0,
+                    'total_count': 0,
+                    'cash_pct':    0.0,
+                    'last_pulled': today.strftime('%Y-%m-%d'),
+                    'source':      'pending',
+                    'metro':       mkt.get('metro', ''),
+                    'state':       mkt.get('state', ''),
+                    'city':        mkt.get('city', '').title(),
+                    'metro_rank':  mkt.get('metro_rank', 999),
+                    'yoy_pct':     mkt.get('yoy_pct', 0),
+                    'dom':         mkt.get('dom', 0),
+                    'ratio':       mkt.get('ratio', 0),
+                    'med_price':   mkt.get('med_price', 0),
+                    'lat':         mkt.get('lat'),
+                    'lon':         mkt.get('lon'),
+                    'lookback_days': LOOKBACK_DAYS,
+                }
             else:
                 try:
-                    last = datetime.strptime(existing['last_pulled'], '%Y-%m-%d').date()
-                    age  = (today - last).days
-                    if age >= REFRESH_DAYS:
-                        to_pull.append((zc, mkt, f'stale ({age}d old)'))
+                    lp = existing.get('last_pulled')
+                    if not lp:
+                        # No date recorded — reset to today, skip ATTOM
+                        zips[zc]['last_pulled'] = today.strftime('%Y-%m-%d')
+                    else:
+                        last = datetime.strptime(lp, '%Y-%m-%d').date()
+                        age  = (today - last).days
+                        if age >= REFRESH_DAYS:
+                            to_pull.append((zc, mkt, f'stale ({age}d old)'))
                 except Exception:
-                    to_pull.append((zc, mkt, 'missing date'))
+                    # Unparseable date — reset, skip ATTOM this cycle
+                    zips[zc]['last_pulled'] = today.strftime('%Y-%m-%d')
 
-        cached = len(qualifying_zips) - len(to_pull)
-        print(f'\n  {len(to_pull)} zips need ATTOM refresh  |  {cached} using cached data')
+        cached = len(qualifying_zips) - len(to_pull) - new_count
+        print(f'\n  {new_count} new qualifying zips added to dashboard (no ATTOM pull yet)')
+        print(f'  {len(to_pull)} existing zips need ATTOM refresh  |  {cached} using current data')
 
         # 6. Update metadata for qualifying zips from fresh Redfin data
         for zc, mkt in qualifying_zips.items():
@@ -912,3 +946,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
