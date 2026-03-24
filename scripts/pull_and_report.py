@@ -40,6 +40,7 @@ REDFIN_SOURCES = {
     "metro": "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/redfin_metro_market_tracker.tsv000.gz",
     "county": "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/county_market_tracker.tsv000.gz",
     "city": "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/city_market_tracker.tsv000.gz",
+    "zip": "https://redfin-public-data.s3.us-west-2.amazonaws.com/redfin_market_tracker/zip_code_market_tracker.tsv000.gz",
 }
 
 # ---------------------------------------------------------------------------
@@ -240,6 +241,15 @@ def process_level(df: pd.DataFrame, level: str) -> pd.DataFrame:
         df["county"] = ""
         df["parent_metro"] = df.get("parent_metro", "").fillna("")
 
+    elif level == "zip":
+        # REGION = 5-digit zip code string (e.g. "90210")
+        region = df.get("region_raw", pd.Series(dtype=str)).fillna("")
+        df["zip_code"] = region.str.extract(r"(\d{5})", expand=False).fillna(region.str.strip())
+        df["display_name"] = df["zip_code"]
+        df["city"] = df.get("city_raw", pd.Series(dtype=str)).fillna("").str.strip()
+        df["county"] = ""
+        df["parent_metro"] = df.get("parent_metro", "").fillna("")
+
     # State: prefer full state name, fall back to code
     if "state" not in df.columns or df["state"].isna().all():
         if "state_code" in df.columns:
@@ -256,9 +266,13 @@ def process_level(df: pd.DataFrame, level: str) -> pd.DataFrame:
         subset=["display_name", "state"], keep="first"
     )
 
+    # Ensure zip_code column exists for all levels
+    if "zip_code" not in df.columns:
+        df["zip_code"] = ""
+
     return df[[
         "level", "display_name", "state", "state_code", "county", "city",
-        "parent_metro", "yoy_pct", "median_price", "dom", "active", "pending", "ratio"
+        "parent_metro", "zip_code", "yoy_pct", "median_price", "dom", "active", "pending", "ratio"
     ] + (["period_end"] if "period_end" in df.columns else [])]
 
 
@@ -402,14 +416,55 @@ def build_map_data(combined: pd.DataFrame) -> dict:
             "total": data["total"],
         }
 
-    print(f"  Map data: {len(county_records):,} county records, {len(state_records)} state records")
-    if county_records:
-        sample = list(county_records.items())[:3]
-        print(f"  Sample keys: {[k for k,v in sample]}")
+    # ---- ZIP CODE centroids ----
+    zip_records = {}
+    zip_df = combined[combined["level"] == "Zip"].copy()
+    if not zip_df.empty:
+        try:
+            import pgeocode
+            nomi = pgeocode.Nominatim("us")
+            zip_codes = list(zip_df["zip_code"].dropna().unique())
+            # Bulk centroid lookup
+            geo = nomi.query_postal_code(zip_codes)
+            geo.index = zip_codes
+            for _, row in zip_df.iterrows():
+                zc = str(row.get("zip_code", "")).strip()
+                if not zc or len(zc) != 5:
+                    continue
+                g = geo.loc[zc] if zc in geo.index else None
+                if g is None or pd.isna(g.get("latitude")) or pd.isna(g.get("longitude")):
+                    continue
+                qualifies = (
+                    row.get("dom") is not None and not pd.isna(row.get("dom")) and
+                    row.get("dom") < DOM_THRESHOLD and
+                    row.get("ratio") is not None and not pd.isna(row.get("ratio")) and
+                    row.get("ratio") >= RATIO_THRESHOLD and
+                    row.get("yoy_pct") is not None and not pd.isna(row.get("yoy_pct"))
+                )
+                state_abbr = str(row.get("state_code", "") or row.get("state", "")).strip()
+                zip_records[zc] = {
+                    "lat": round(float(g["latitude"]), 4),
+                    "lon": round(float(g["longitude"]), 4),
+                    "state": state_abbr,
+                    "city": str(row.get("city", "") or ""),
+                    "yoy": to_serializable(row.get("yoy_pct")),
+                    "dom": to_serializable(row.get("dom")),
+                    "ratio": to_serializable(row.get("ratio")),
+                    "price": to_serializable(row.get("median_price")),
+                    "active": to_serializable(row.get("active")),
+                    "pending": to_serializable(row.get("pending")),
+                    "qualifies": qualifies,
+                }
+            print(f"  Map data: {len(zip_records):,} zip records with centroids")
+        except Exception as e:
+            print(f"  WARNING: zip centroid lookup failed ({e}), zip map disabled")
+
+    print(f"  Map data: {len(county_records):,} county records, {len(state_records)} state records, {len(zip_records):,} zip records")
 
     return {
         "counties": county_records,
         "states": state_records,
+        "zips": zip_records,
     }
 
 
@@ -424,6 +479,7 @@ def build_data_json(df: pd.DataFrame) -> str:
             "state": to_serializable(row.get("state", "")),
             "county": to_serializable(row.get("county", "")),
             "city": to_serializable(row.get("city", "")),
+            "zip": to_serializable(row.get("zip_code", "")),
             "metro": to_serializable(row.get("parent_metro", "")),
             "yoy": to_serializable(row.get("yoy_pct")),
             "price": to_serializable(row.get("median_price")),
@@ -450,6 +506,9 @@ def generate_html(qualified: pd.DataFrame, combined: pd.DataFrame, criteria_rela
 
     counties = sorted(qualified[qualified["county"] != ""]["county"].dropna().unique().tolist())
     county_options = "\n".join([f'<option value="{c}">{c}</option>' for c in counties[:500]])
+
+    zip_codes = sorted(qualified[qualified["zip_code"].notna() & (qualified["zip_code"] != "")]["zip_code"].unique().tolist())
+    zip_options = "\n".join([f'<option value="{z}">{z}</option>' for z in zip_codes[:2000]])
 
     relaxed_html = (
         f'<div class="notice warn">⚠️ Fewer than {TOP_N} metros met DOM &lt; {DOM_THRESHOLD}d criteria. '
@@ -559,6 +618,7 @@ td{{padding:12px 14px;vertical-align:middle}}
 .lvl-metro{{background:rgba(63,185,80,.1);color:#3fb950;border:1px solid rgba(63,185,80,.25)}}
 .lvl-county{{background:rgba(88,166,255,.1);color:#58a6ff;border:1px solid rgba(88,166,255,.25)}}
 .lvl-city{{background:rgba(210,153,34,.1);color:#d29922;border:1px solid rgba(210,153,34,.25)}}
+.lvl-zip{{background:rgba(196,132,255,.1);color:#c084fc;border:1px solid rgba(196,132,255,.25)}}
 .badge{{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;font-weight:600}}
 .g{{background:rgba(63,185,80,.1);color:#3fb950;border:1px solid rgba(63,185,80,.2)}}
 .y{{background:rgba(210,153,34,.1);color:#d29922;border:1px solid rgba(210,153,34,.2)}}
@@ -586,7 +646,7 @@ td{{padding:12px 14px;vertical-align:middle}}
 <div class="topbar">
   <div>
     <h1>📊 Market Research — <em>{today}</em></h1>
-    <div style="font-size:12px;color:#8b949e;margin-top:3px">Interactive USA Map · Metro · County · City  |  All 50 states  |  Redfin data</div>
+    <div style="font-size:12px;color:#8b949e;margin-top:3px">Interactive USA Map · Metro · County · City · Zip  |  All 50 states  |  Redfin SFR data</div>
   </div>
   <div class="topbar-meta">
     <strong>Generated</strong>{generated_at}
@@ -615,7 +675,7 @@ td{{padding:12px 14px;vertical-align:middle}}
     <div class="card">
       <div class="card-lbl">Total Qualifying</div>
       <div class="card-val">{total_q:,}</div>
-      <div class="card-sub">Across metro + county + city</div>
+      <div class="card-sub">Metro + County + City + Zip</div>
     </div>
   </div>
 
@@ -631,6 +691,7 @@ td{{padding:12px 14px;vertical-align:middle}}
         <div class="level-tabs" id="mapLevelTabs">
           <div class="level-tab active" data-level="counties">Counties</div>
           <div class="level-tab" data-level="states">States</div>
+          <div class="level-tab" data-level="zips">Zip Codes</div>
         </div>
       </div>
       <select id="mapStateFilter">
@@ -673,6 +734,7 @@ td{{padding:12px 14px;vertical-align:middle}}
           <div class="level-tab active" data-level="Metro">Metro</div>
           <div class="level-tab" data-level="County">County</div>
           <div class="level-tab" data-level="City">City</div>
+          <div class="level-tab" data-level="Zip">Zip</div>
           <div class="level-tab" data-level="">All</div>
         </div>
       </div>
@@ -683,6 +745,10 @@ td{{padding:12px 14px;vertical-align:middle}}
       <select id="countyFilter" onchange="applyFilters()">
         <option value="">All Counties</option>
         {county_options}
+      </select>
+      <select id="zipFilter" onchange="applyFilters()">
+        <option value="">All Zips</option>
+        {zip_options}
       </select>
       <input type="text" id="searchBox" placeholder="🔍  Search market, city, zip..." oninput="applyFilters()">
       <button class="btn-dl" onclick="downloadCSV()">⬇ Export CSV</button>
@@ -697,6 +763,7 @@ td{{padding:12px 14px;vertical-align:middle}}
             <th onclick="sortBy('_rank')">#</th>
             <th onclick="sortBy('level')">Level <span id="arr_level"></span></th>
             <th onclick="sortBy('name')">Market <span id="arr_name"></span></th>
+            <th onclick="sortBy('zip')">Zip <span id="arr_zip"></span></th>
             <th onclick="sortBy('state')">State <span id="arr_state"></span></th>
             <th onclick="sortBy('county')">County <span id="arr_county"></span></th>
             <th onclick="sortBy('metro')">Metro <span id="arr_metro"></span></th>
@@ -715,7 +782,7 @@ td{{padding:12px 14px;vertical-align:middle}}
   </div>
 
   <div class="footer">
-    Source: Redfin Market Tracker (Metro · County · City) &nbsp;|&nbsp;
+    Source: Redfin Market Tracker (Metro · County · City · Zip) &nbsp;|&nbsp;
     Criteria: DOM &lt; {DOM_THRESHOLD}d · Pending/Active ≥ {RATIO_THRESHOLD} · Ranked by YoY% &nbsp;|&nbsp;
     Generated: {generated_at}
   </div>
@@ -733,6 +800,7 @@ const stateCodeMap = {{"01":"AL","02":"AK","04":"AZ","05":"AR","06":"CA","08":"C
 let mapLevel = 'counties';
 let selectedMapState = '';
 let topoData = null;
+const ZIP_DATA = MAP_DATA.zips || {{}};
 
 function normalizeName(name) {{
   const suffixes = [' County', ' Parish', ' Borough', ' Census Area', ' City', ' Municipality'];
@@ -967,6 +1035,103 @@ function renderMap() {{
         d3.select(this).attr('stroke-width', 1).attr('stroke', '#30363d');
         d3.select('#tooltip').style('display', 'none');
       }});
+
+  }} else if (mapLevel === 'zips') {{
+    // Draw faint county outlines as backdrop
+    const counties = topojson.feature(topoData, topoData.objects.counties).features;
+    svg.selectAll('.county-bg')
+      .data(counties)
+      .enter()
+      .append('path')
+      .attr('class', 'county-bg')
+      .attr('d', path)
+      .attr('fill', '#111827')
+      .attr('stroke', '#1f2937')
+      .attr('stroke-width', 0.3);
+
+    // Draw state borders
+    const stateMesh = topojson.mesh(topoData, topoData.objects.states, (a, b) => a !== b);
+    svg.append('path')
+      .attr('d', path(stateMesh))
+      .attr('fill', 'none')
+      .attr('stroke', '#30363d')
+      .attr('stroke-width', 1);
+
+    // Filter zip data by selected state
+    const zipEntries = Object.entries(ZIP_DATA).filter(([z, d]) => {{
+      if (selectedMapState && d.state !== selectedMapState) return false;
+      return d.lat && d.lon;
+    }});
+
+    if (zipEntries.length === 0) {{
+      svg.append('text')
+        .attr('x', width / 2)
+        .attr('y', height / 2 - 10)
+        .attr('text-anchor', 'middle')
+        .attr('fill', '#8b949e')
+        .attr('font-size', '16px')
+        .text(Object.keys(ZIP_DATA).length === 0
+          ? 'Zip code map not available (pgeocode not installed)'
+          : 'Select a state above to see zip code dots');
+    }} else {{
+      // Plot zip codes as circles sized by pending activity
+      const allPending = zipEntries.map(([,d]) => d.pending || 0);
+      const maxPending = Math.max(...allPending, 1);
+      const rScale = v => Math.max(3, Math.min(12, 3 + (v / maxPending) * 9));
+
+      // Non-qualifying zips first (behind), qualifying on top
+      const sorted = [...zipEntries].sort((a, b) => (a[1].qualifies ? 1 : -1) - (b[1].qualifies ? 1 : -1));
+
+      sorted.forEach(([zipCode, d]) => {{
+        const proj = projection([d.lon, d.lat]);
+        if (!proj) return;
+        const [cx, cy] = proj;
+        const r = rScale(d.pending || 0);
+
+        svg.append('circle')
+          .attr('cx', cx)
+          .attr('cy', cy)
+          .attr('r', r)
+          .attr('fill', colorScale(d.yoy))
+          .attr('fill-opacity', d.qualifies ? 0.9 : 0.55)
+          .attr('stroke', d.qualifies ? '#a3e635' : 'none')
+          .attr('stroke-width', d.qualifies ? 1.5 : 0)
+          .style('cursor', 'pointer')
+          .on('mouseover', function(e) {{
+            d3.select(this).attr('r', r + 3).attr('fill-opacity', 1);
+            let html = '<strong>' + zipCode + '</strong>';
+            if (d.city) html += ' — ' + d.city + ', ' + d.state;
+            else html += ', ' + d.state;
+            html += '<br/>YoY: ' + (d.yoy !== null ? d.yoy.toFixed(1) + '%' : 'N/A');
+            html += '<br/>DOM: ' + (d.dom !== null ? Math.round(d.dom) + 'd' : 'N/A');
+            html += '<br/>Ratio: ' + (d.ratio !== null ? d.ratio.toFixed(2) : 'N/A');
+            html += '<br/>Price: ' + (d.price !== null ? '$' + Math.round(d.price).toLocaleString() : 'N/A');
+            html += '<br/>Active: ' + (d.active !== null ? d.active.toLocaleString() : 'N/A');
+            html += '<br/>Pending: ' + (d.pending !== null ? d.pending.toLocaleString() : 'N/A');
+            if (d.qualifies) html += '<br/><span style="color:#a3e635;font-weight:600">✓ Qualifies</span>';
+            d3.select('#tooltip').html(html)
+              .style('display', 'block')
+              .style('left', (e.pageX + 10) + 'px')
+              .style('top', (e.pageY + 10) + 'px');
+          }})
+          .on('mousemove', function(e) {{
+            d3.select('#tooltip')
+              .style('left', (e.pageX + 10) + 'px')
+              .style('top', (e.pageY + 10) + 'px');
+          }})
+          .on('mouseout', function() {{
+            d3.select(this).attr('r', r).attr('fill-opacity', d.qualifies ? 0.9 : 0.55);
+            d3.select('#tooltip').style('display', 'none');
+          }});
+      }});
+
+      // Count label
+      const qualCount = zipEntries.filter(([,d]) => d.qualifies).length;
+      svg.append('text')
+        .attr('x', 16).attr('y', 20)
+        .attr('fill', '#8b949e').attr('font-size', '11px')
+        .text(`${{zipEntries.length.toLocaleString()}} zips shown · ${{qualCount.toLocaleString()}} qualify (outlined)`);
+    }}
   }}
 }}
 
@@ -1044,7 +1209,7 @@ let filtered = [];
 function fmt$(v){{ return v==null?'N/A':'$'+Math.round(v).toLocaleString(); }}
 function fmtPct(v){{ if(v==null)return 'N/A'; return (v>=0?'+':'')+v.toFixed(1)+'%'; }}
 function fmtRatio(v){{ return v==null?'N/A':v.toFixed(2); }}
-function lvlClass(l){{ return l==='Metro'?'lvl-metro':l==='County'?'lvl-county':'lvl-city'; }}
+function lvlClass(l){{ return l==='Metro'?'lvl-metro':l==='County'?'lvl-county':l==='Zip'?'lvl-zip':'lvl-city'; }}
 function ratioBadge(v){{ if(v==null||v<0.5)return 'r'; if(v<0.75)return 'y'; return 'g'; }}
 function domBadge(v){{ if(v==null||v>=45)return 'r'; if(v>=20)return 'y'; return 'g'; }}
 function yoyClass(v){{ if(v==null)return ''; if(v>=10)return 'yoy-h'; if(v>=5)return 'yoy-m'; if(v>=0)return 'yoy-l'; return 'yoy-n'; }}
@@ -1053,13 +1218,15 @@ function rankClass(r){{ if(r===1)return 'gold'; if(r===2)return 'silver'; if(r==
 function getFiltered(){{
   const st = document.getElementById('stateFilter').value;
   const co = document.getElementById('countyFilter').value;
+  const zp = document.getElementById('zipFilter').value;
   const q  = document.getElementById('searchBox').value.toLowerCase();
   return ALL_DATA.filter(r=>{{
     if(activeLevel && r.level !== activeLevel) return false;
     if(st && r.state !== st) return false;
     if(co && r.county !== co) return false;
+    if(zp && r.zip !== zp) return false;
     if(q){{
-      const hay = [r.name,r.state,r.county,r.city,r.metro].join(' ').toLowerCase();
+      const hay = [r.name,r.state,r.county,r.city,r.metro,r.zip].join(' ').toLowerCase();
       if(!hay.includes(q)) return false;
     }}
     return true;
@@ -1097,6 +1264,7 @@ function render(){{
         <div class="primary">${{r.name}}</div>
         ${{secLine?'<div class="secondary">'+secLine+'</div>':''}}
       </td>
+      <td style="font-family:monospace;font-size:12px;color:#c084fc">${{r.zip||'—'}}</td>
       <td>${{r.state||'—'}}</td>
       <td>${{r.county||'—'}}</td>
       <td style="font-size:12px;color:#8b949e">${{r.metro||'—'}}</td>
@@ -1140,9 +1308,9 @@ document.querySelectorAll('#levelTabs .level-tab').forEach(tab=>{{
 }});
 
 function downloadCSV(){{
-  const headers=['Rank','Level','Market','State','County','Metro','YoY%','Med Price','DOM','Active','Pending','Ratio'];
+  const headers=['Rank','Level','Market','Zip','State','County','City','Metro','YoY%','Med Price','DOM','Active','Pending','Ratio'];
   const rows=filtered.map((r,i)=>[
-    i+1,r.level,'"'+(r.name||'')+'"',r.state||'','"'+(r.county||'')+'"','"'+(r.metro||'')+'"',
+    i+1,r.level,'"'+(r.name||'')+'"',r.zip||'',r.state||'','"'+(r.county||'')+'"','"'+(r.city||'')+'"','"'+(r.metro||'')+'"',
     r.yoy!=null?r.yoy.toFixed(2):'',r.price||'',r.dom!=null?Math.round(r.dom):'',
     r.active||'',r.pending||'',r.ratio!=null?r.ratio.toFixed(3):''
   ]);
@@ -1186,7 +1354,7 @@ def main():
     print("=" * 60)
 
     frames = {}
-    for level in ["metro", "county", "city"]:
+    for level in ["metro", "county", "city", "zip"]:
         print(f"\n[{level.upper()}]")
         try:
             frames[level] = get_level_data(level)
@@ -1203,6 +1371,13 @@ def main():
 
     # Sort by YoY descending
     qualified = qualified.sort_values("yoy_pct", ascending=False).reset_index(drop=True)
+
+    zips = qualified[qualified["level"] == "Zip"]
+    if not zips.empty:
+        print(f"\nTop 5 zip codes:")
+        for _, r in zips.head(5).iterrows():
+            city_str = f" ({r['city']})" if r.get('city') else ""
+            print(f"  {r['display_name']}{city_str}, {r['state']} — YoY: {r['yoy_pct']:+.1f}%  DOM: {r['dom']:.0f}d  Ratio: {r['ratio']:.2f}")
 
     print(f"\nTop 5 metros:")
     metros = qualified[qualified["level"] == "Metro"].head(5)
