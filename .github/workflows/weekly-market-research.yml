@@ -41,6 +41,11 @@ jobs:
           LATEST=$(ls docs/market_research_*.html | sort | tail -1)
           cp "$LATEST" docs/index.html
 
+      - name: Generate cash sales dashboard
+              run: python scripts/pull_cash_sales.py
+                      env:
+                                ATTOM_API_KEY: ${{ secrets.ATTOM_API_KEY }}
+                                
       - name: Commit report
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
