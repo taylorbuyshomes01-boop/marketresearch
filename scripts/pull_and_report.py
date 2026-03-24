@@ -1395,7 +1395,79 @@ def main():
 
     print(f"\n✅ Dashboard saved: {out_path}")
     print(f"   {len(qualified):,} qualifying markets  |  Metro / County / City tabs")
+
+    # Save qualifying markets JSON for cash sales dashboard
+    save_qualifying_markets(qualified, args.output)
+
     return out_path
+
+
+def save_qualifying_markets(qualified_df, output_path="."):
+    """
+    Save the qualifying zip markets to docs/qualifying_markets.json.
+    Consumed by pull_cash_sales.py to determine which zips need ATTOM refresh.
+    """
+    try:
+        zip_df = qualified_df[qualified_df["level"] == "Zip"].copy()
+        if zip_df.empty:
+            print("  No qualifying zip markets to export.")
+            return
+
+        # Bulk lat/lon lookup via pgeocode (already imported earlier in script)
+        try:
+            import pgeocode
+            nomi = pgeocode.Nominatim("us")
+            zip_codes = list(zip_df["zip_code"].dropna().unique())
+            geo = nomi.query_postal_code(zip_codes)
+            geo.index = zip_codes
+        except Exception:
+            geo = None
+
+        markets = []
+        for _, row in zip_df.iterrows():
+            zc = str(row.get("zip_code", "")).strip()
+            if not zc or len(zc) != 5:
+                continue
+
+            lat = lon = None
+            if geo is not None and zc in geo.index:
+                g = geo.loc[zc]
+                try:
+                    if not pd.isna(g.get("latitude")):
+                        lat = round(float(g["latitude"]), 4)
+                        lon = round(float(g["longitude"]), 4)
+                except Exception:
+                    pass
+
+            # Resolve metro name from parent_metro or display_name
+            metro_name = str(row.get("parent_metro", "") or row.get("display_name", "")).strip()
+
+            markets.append({
+                "zip":        zc,
+                "state":      str(row.get("state", "")),
+                "state_code": str(row.get("state_code", "")),
+                "city":       str(row.get("city", "") or "").strip().title(),
+                "metro":      metro_name,
+                "metro_rank": int(row.name) + 1 if hasattr(row, "name") else 0,
+                "yoy_pct":    float(row.get("yoy_pct", 0) or 0),
+                "dom":        float(row.get("dom", 0) or 0),
+                "ratio":      float(row.get("ratio", 0) or 0),
+                "med_price":  float(row.get("median_price", 0) or 0),
+                "lat":        lat,
+                "lon":        lon,
+            })
+
+        out_file = os.path.join(output_path, "qualifying_markets.json")
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "count":     len(markets),
+                "zips":      markets,
+            }, f, default=str)
+
+        print(f"  Saved qualifying_markets.json ({len(markets)} qualifying zip codes)")
+    except Exception as e:
+        print(f"  WARNING: Could not save qualifying_markets.json: {e}")
 
 
 if __name__ == "__main__":
