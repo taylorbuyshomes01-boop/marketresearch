@@ -76,7 +76,7 @@ def save_cache(level: str, df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # STREAMING DOWNLOAD + FILTER
 # Streams the compressed file in chunks, decompresses, and reads only
-# rows for the most recent period + All Residential property type.
+# rows for the most recent period + Single Family Residential property type.
 # This keeps memory usage low for large files (city = 988 MB compressed).
 # ---------------------------------------------------------------------------
 
@@ -84,7 +84,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; market-research/1.0)"}
 
 
 def stream_and_filter(url: str, level: str) -> pd.DataFrame:
-    """Stream download, decompress, and filter to latest period + All Residential."""
+    """Stream download, decompress, and filter to latest period + Single Family Residential."""
     print(f"  Streaming {level} data from Redfin...")
     resp = requests.get(url, headers=HEADERS, timeout=300, stream=True)
     resp.raise_for_status()
@@ -109,7 +109,7 @@ def stream_and_filter(url: str, level: str) -> pd.DataFrame:
 
             # Filter property type early
             if "property_type" in chunk_df.columns:
-                chunk_df = chunk_df[chunk_df["property_type"] == "All Residential"]
+                chunk_df = chunk_df[chunk_df["property_type"] == "Single Family Residential"]
 
             if len(chunk_df) > 0:
                 chunks.append(chunk_df)
@@ -119,7 +119,7 @@ def stream_and_filter(url: str, level: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.concat(chunks, ignore_index=True)
-    print(f"  Loaded {len(df):,} rows (All Residential)")
+    print(f"  Loaded {len(df):,} rows (Single Family Residential)")
 
     # Keep only most recent period
     if "period_end" in df.columns:
